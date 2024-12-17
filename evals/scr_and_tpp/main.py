@@ -79,42 +79,34 @@ def get_effects_per_class_precomputed_acts(
         nonzero_acts_BL = (activations_BL != 0.0).to(dtype=dtype)
         nonzero_acts_B = einops.reduce(nonzero_acts_BL, "B L -> B", "sum").to(torch.float32)
 
-        f_BLF = sae.encode(activation_batch_BLD).to(nonzero_acts_BL.device)
+        # ### FIXED: Detach after encoding ###
+        f_BLF = sae.encode(activation_batch_BLD).detach()
         f_BLF = f_BLF * nonzero_acts_BL[:, :, None]  # zero out masked tokens
 
-        # Get the average activation per input. We divide by the number of nonzero activations for the attention mask
         average_sae_acts_BF = (
             einops.reduce(f_BLF, "B L F -> B F", "sum").to(torch.float32) / nonzero_acts_B[:, None]
         )
 
-        # Separate positive and negative samples
         pos_mask = labels_batch_B == dataset_info.POSITIVE_CLASS_LABEL
         neg_mask = labels_batch_B == dataset_info.NEGATIVE_CLASS_LABEL
 
-        # Accumulate sums in fp32
         running_sum_pos_F += einops.reduce(average_sae_acts_BF[pos_mask], "B F -> F", "sum")
         running_sum_neg_F += einops.reduce(average_sae_acts_BF[neg_mask], "B F -> F", "sum")
 
         count_pos += pos_mask.sum().item()
         count_neg += neg_mask.sum().item()
 
-    # Calculate means in fp32
     average_pos_sae_acts_F = running_sum_pos_F / count_pos if count_pos > 0 else running_sum_pos_F
     average_neg_sae_acts_F = running_sum_neg_F / count_neg if count_neg > 0 else running_sum_neg_F
 
-    # The decoder matrix can be very large, so we move it to the same device as the activations
     average_acts_F = (average_pos_sae_acts_F - average_neg_sae_acts_F).to(dtype)
 
-    probe_weight_D = probe.net.weight.to(dtype=dtype, device=device)
-    decoder_weight_DF = sae.W_dec.data.T.to(dtype=dtype, device=device)
-
-    dot_prod_F = (probe_weight_D @ decoder_weight_DF).squeeze()
+    probe_weight_F = probe.net.weight.to(dtype=dtype, device=device).squeeze()
 
     if not perform_scr:
-        # Only consider activations from the positive class
         average_acts_F.clamp_(min=0.0)
 
-    effects_F = (average_acts_F * dot_prod_F).to(dtype=torch.float32)
+    effects_F = (average_acts_F * probe_weight_F).to(dtype=torch.float32)
 
     if perform_scr:
         effects_F = effects_F.abs()
@@ -149,7 +141,6 @@ def select_top_n_features(effects: torch.Tensor, n: int, class_name: str) -> tor
         n <= effects.numel()
     ), f"n ({n}) must not be larger than the number of features ({effects.numel()}) for ablation class {class_name}"
 
-    # Find non-zero effects
     non_zero_mask = effects != 0
     non_zero_effects = effects[non_zero_mask]
     num_non_zero = non_zero_effects.numel()
@@ -159,7 +150,6 @@ def select_top_n_features(effects: torch.Tensor, n: int, class_name: str) -> tor
             f"WARNING: only {num_non_zero} non-zero effects found for ablation class {class_name}, which is less than the requested {n}."
         )
 
-    # Select top n or all non-zero effects, whichever is smaller
     k = min(n, num_non_zero)
 
     if k == 0:
@@ -168,13 +158,9 @@ def select_top_n_features(effects: torch.Tensor, n: int, class_name: str) -> tor
         )
         top_n_features = torch.zeros_like(effects, dtype=torch.bool)
     else:
-        # Get the indices of the top N effects
         _, top_indices = torch.topk(effects, k)
-
-        # Create a boolean mask tensor
         mask = torch.zeros_like(effects, dtype=torch.bool)
         mask[top_indices] = True
-
         top_n_features = mask
 
     return top_n_features
@@ -186,9 +172,8 @@ def ablated_precomputed_activations(
     to_ablate: torch.Tensor,
     sae_batch_size: int,
 ) -> torch.Tensor:
-    """NOTE: We don't pass in the attention mask. Thus, we must have already zeroed out all masked tokens in ablation_acts_BLD."""
-
-    all_acts_list_BD = []
+    """Now returns [B, F] latents suitable for the probe."""
+    all_acts_list_BF = []
 
     for i in range(0, ablation_acts_BLD.shape[0], sae_batch_size):
         activation_batch_BLD = ablation_acts_BLD[i : i + sae_batch_size]
@@ -196,26 +181,28 @@ def ablated_precomputed_activations(
 
         activations_BL = einops.reduce(activation_batch_BLD, "B L D -> B L", "sum")
         nonzero_acts_BL = (activations_BL != 0.0).to(dtype=dtype)
-        nonzero_acts_B = einops.reduce(nonzero_acts_BL, "B L -> B", "sum")
+        nonzero_acts_B = einops.reduce(nonzero_acts_BL, "B L -> B", "sum").float()
 
-        f_BLF = sae.encode(activation_batch_BLD)
-        x_hat_BLD = sae.decode(f_BLF).to(activation_batch_BLD.device)
+        # Encode to get latents
+        f_BLF = sae.encode(activation_batch_BLD).detach()
+        x_hat_BLD = sae.decode(f_BLF)
 
         error_BLD = activation_batch_BLD - x_hat_BLD
 
-        f_BLF[..., to_ablate] = 0.0  # zero ablation
+        f_BLF[..., to_ablate] = 0.0  # zero out chosen features in latent space
 
-        modified_acts_BLD = sae.decode(f_BLF).to(error_BLD.device) + error_BLD
+        modified_acts_BLD = sae.decode(f_BLF) + error_BLD
 
-        # Get the average activation per input. We divide by the number of nonzero activations for the attention mask
-        probe_acts_BD = (
-            einops.reduce(modified_acts_BLD, "B L D -> B D", "sum") / nonzero_acts_B[:, None]
-        )
-        all_acts_list_BD.append(probe_acts_BD)
+        # Re-encode modified acts back into SAE latents to get [B, L, F]
+        f_modified_BLF = sae.encode(modified_acts_BLD).detach()
 
-    all_acts_BD = torch.cat(all_acts_list_BD, dim=0)
+        # Mean-reduce over sequence dimension L to get [B, F]
+        average_sae_acts_BF = einops.reduce(f_modified_BLF, "B L F -> B F", "sum") / nonzero_acts_B[:, None]
+        all_acts_list_BF.append(average_sae_acts_BF)
 
-    return all_acts_BD
+    # Concatenate all batches along B dimension
+    all_acts_BF = torch.cat(all_acts_list_BF, dim=0)
+    return all_acts_BF
 
 
 def get_probe_test_accuracy(
@@ -254,7 +241,6 @@ def get_scr_probe_test_accuracy(
     all_activations: dict[str, torch.Tensor],
     probe_batch_size: int,
 ) -> dict[str, float]:
-    """Tests e.g. male_professor / female_nurse probe on professor / nurse labels"""
     test_accuracies = {}
     for class_name in all_class_list:
         if class_name not in dataset_info.PAIRED_CLASS_KEYS:
@@ -318,10 +304,6 @@ def get_scr_plotting_dict(
     class_accuracies: dict[str, dict[int, dict[str, float]]],
     llm_clean_accs: dict[str, float],
 ) -> dict[str, float]:
-    """raw_results: dict[class_name][threshold][class_name] = float
-    llm_clean_accs: dict[class_name] = float
-    Returns: dict[metric_name] = float"""
-
     results = {}
     eval_probe_class_id = "male_professor / female_nurse"
 
@@ -359,7 +341,6 @@ def get_scr_plotting_dict(
             )
 
             metric_key = f"scr_dir{dir}_threshold_{threshold}"
-
             results[metric_key] = scr_score
 
             scr_metric_key = f"scr_metric_threshold_{threshold}"
@@ -375,10 +356,6 @@ def create_tpp_plotting_dict(
     class_accuracies: dict[str, dict[int, dict[str, float]]],
     llm_clean_accs: dict[str, float],
 ) -> dict[str, float]:
-    """raw_results: dict[class_name][threshold][class_name] = float
-    llm_clean_accs: dict[class_name] = float
-    Returns: dict[metric_name] = float"""
-
     results = {}
     intended_diffs = {}
     unintended_diffs = {}
@@ -393,12 +370,10 @@ def create_tpp_plotting_dict(
 
         for threshold in class_accuracies[class_name]:
             intended_patched_acc = class_accuracies[class_name][threshold][class_name]
-
             intended_diff = intended_clean_acc - intended_patched_acc
 
             if threshold not in intended_diffs:
                 intended_diffs[threshold] = []
-
             intended_diffs[threshold].append(intended_diff)
 
         for intended_class_id in classes:
@@ -416,7 +391,6 @@ def create_tpp_plotting_dict(
 
                     if threshold not in unintended_diffs:
                         unintended_diffs[threshold] = []
-
                     unintended_diffs[threshold].append(unintended_diff)
 
         for threshold in intended_diffs:
@@ -478,6 +452,25 @@ def get_dataset_activations(
     return all_train_acts_BLD, all_test_acts_BLD
 
 
+def create_meaned_sae_activations(all_acts_BLD: dict[str, torch.Tensor], sae: SAE, sae_batch_size: int) -> dict[str, torch.Tensor]:
+    result = {}
+    for class_name, acts_BLD in all_acts_BLD.items():
+        all_batches_BF = []
+        for i in range(0, acts_BLD.shape[0], sae_batch_size):
+            batch_BLD = acts_BLD[i : i + sae_batch_size]
+            # ### FIXED: Detach after encoding ###
+            f_BLF = sae.encode(batch_BLD).detach()
+
+            activations_BL = einops.reduce(batch_BLD, "B L D -> B L", "sum")
+            nonzero_acts_BL = (activations_BL != 0.0)
+            nonzero_acts_B = einops.reduce(nonzero_acts_BL, "B L -> B", "sum").float()
+
+            average_sae_acts_BF = (einops.reduce(f_BLF, "B L F -> B F", "sum") / nonzero_acts_B[:, None])
+            all_batches_BF.append(average_sae_acts_BF)
+        result[class_name] = torch.cat(all_batches_BF, dim=0)
+    return result
+
+
 def run_eval_single_dataset(
     dataset_name: str,
     config: ScrAndTppEvalConfig,
@@ -486,115 +479,71 @@ def run_eval_single_dataset(
     layer: int,
     hook_point: str,
     device: str,
-    artifacts_folder: str,
-    save_activations: bool = True,
+    # artifacts_folder: str,  # No longer needed for this simplified version
+    # save_activations: bool = True,  # No longer needed
     column1_vals: Optional[tuple[str, str]] = None,
-) -> tuple[dict[str, dict[str, dict[int, dict[str, float]]]], dict[str, float]]:
-    """Return dict is of the form:
-    dict[ablated_class_name][threshold][measured_acc_class_name] = float
-
-    config: eval_config.EvalConfig contains all hyperparameters to reproduce the evaluation.
-    It is saved in the results_dict for reproducibility."""
-
+) -> tuple[dict[str, dict[int, dict[str, float]]], dict[str, float]]:
+    """
+    Compute dataset activations, train the probe on SAE latents, compute node effects, 
+    and perform feature ablations. This version does not save or load activations or probes.
+    """
     column2_vals = COLUMN2_VALS_LOOKUP[dataset_name]
 
     if not config.perform_scr:
         chosen_classes = dataset_info.chosen_classes_per_dataset[dataset_name]
-        activations_filename = f"{dataset_name}_activations.pt".replace("/", "_")
-        probes_filename = f"{dataset_name}_probes.pkl".replace("/", "_")
     else:
         chosen_classes = list(dataset_info.PAIRED_CLASS_KEYS.keys())
-        activations_filename = (
-            f"{dataset_name}_{column1_vals[0]}_{column1_vals[1]}_activations.pt".replace("/", "_")
-        )
-        probes_filename = f"{dataset_name}_{column1_vals[0]}_{column1_vals[1]}_probes.pkl".replace(
-            "/", "_"
-        )
 
-    activations_path = os.path.join(artifacts_folder, activations_filename)
-    probes_path = os.path.join(artifacts_folder, probes_filename)
+    # Compute LLM activations fresh every time
+    if config.lower_vram_usage:
+        model = model.to(device)
+    all_train_acts_BLD, all_test_acts_BLD = get_dataset_activations(
+        dataset_name,
+        config,
+        model,
+        config.llm_batch_size,
+        layer,
+        hook_point,
+        device,
+        chosen_classes,
+        column1_vals,
+        column2_vals,
+    )
+    if config.lower_vram_usage:
+        model = model.to("cpu")
 
-    if not os.path.exists(activations_path):
-        if config.lower_vram_usage:
-            model = model.to(device)
-        all_train_acts_BLD, all_test_acts_BLD = get_dataset_activations(
-            dataset_name,
-            config,
-            model,
-            config.llm_batch_size,
-            layer,
-            hook_point,
-            device,
-            chosen_classes,
-            column1_vals,
-            column2_vals,
-        )
-        if config.lower_vram_usage:
-            model = model.to("cpu")
+    # Create SAE latents (meaned)
+    all_meaned_train_sae_acts_BF = create_meaned_sae_activations(all_train_acts_BLD, sae, config.sae_batch_size)
+    all_meaned_test_sae_acts_BF = create_meaned_sae_activations(all_test_acts_BLD, sae, config.sae_batch_size)
 
-        all_meaned_train_acts_BD = activation_collection.create_meaned_model_activations(
-            all_train_acts_BLD
-        )
-        all_meaned_test_acts_BD = activation_collection.create_meaned_model_activations(
-            all_test_acts_BLD
-        )
+    # Train probe from scratch
+    torch.set_grad_enabled(True)
+    llm_probes, llm_test_accuracies = probe_training.train_probe_on_activations(
+        all_meaned_train_sae_acts_BF,
+        all_meaned_test_sae_acts_BF,
+        select_top_k=None,
+        use_sklearn=False,
+        batch_size=config.probe_train_batch_size,
+        epochs=config.probe_epochs,
+        lr=config.probe_lr,
+        perform_scr=config.perform_scr,
+        early_stopping_patience=config.early_stopping_patience,
+        l1_penalty=config.probe_l1_penalty,
+    )
+    torch.set_grad_enabled(False)
 
-        torch.set_grad_enabled(True)
-
-        llm_probes, llm_test_accuracies = probe_training.train_probe_on_activations(
-            all_meaned_train_acts_BD,
-            all_meaned_test_acts_BD,
-            select_top_k=None,
-            use_sklearn=False,
-            batch_size=config.probe_train_batch_size,
-            epochs=config.probe_epochs,
-            lr=config.probe_lr,
-            perform_scr=config.perform_scr,
-            early_stopping_patience=config.early_stopping_patience,
-            l1_penalty=config.probe_l1_penalty,
-        )
-
-        torch.set_grad_enabled(False)
-
-        llm_test_accuracies = get_probe_test_accuracy(
-            llm_probes,
-            chosen_classes,
-            all_meaned_test_acts_BD,
-            config.probe_test_batch_size,
-            config.perform_scr,
-        )
-
-        acts = {
-            "train": all_train_acts_BLD,
-            "test": all_test_acts_BLD,
-        }
-
-        llm_probes_dict = {
-            "llm_probes": llm_probes,
-            "llm_test_accuracies": llm_test_accuracies,
-        }
-
-        if save_activations:
-            torch.save(acts, activations_path)
-            with open(probes_path, "wb") as f:
-                pickle.dump(llm_probes_dict, f)
-    else:
-        if config.lower_vram_usage:
-            model = model.to("cpu")
-        print(f"Loading activations from {activations_path}")
-        acts = torch.load(activations_path)
-        all_train_acts_BLD = acts["train"]
-        all_test_acts_BLD = acts["test"]
-
-        print(f"Loading probes from {probes_path}")
-        with open(probes_path, "rb") as f:
-            llm_probes_dict = pickle.load(f)
-
-        llm_probes = llm_probes_dict["llm_probes"]
-        llm_test_accuracies = llm_probes_dict["llm_test_accuracies"]
+    # Evaluate the trained probe on test set
+    llm_test_accuracies = get_probe_test_accuracy(
+        llm_probes,
+        chosen_classes,
+        all_meaned_test_sae_acts_BF,
+        config.probe_test_batch_size,
+        config.perform_scr,
+    )
 
     torch.set_grad_enabled(False)
 
+    # Compute node effects using the trained probe
     sae_node_effects = get_all_node_effects_for_one_sae(
         sae,
         llm_probes,
@@ -604,6 +553,7 @@ def run_eval_single_dataset(
         config.sae_batch_size,
     )
 
+    # Perform feature ablations and re-encode through SAE to get latents before probe testing
     ablated_class_accuracies = perform_feature_ablations(
         llm_probes,
         sae,
@@ -624,21 +574,14 @@ def run_eval_single_sae(
     sae: SAE,
     model: HookedTransformer,
     device: str,
-    artifacts_folder: str,
-    save_activations: bool = True,
 ) -> dict[str, float | dict[str, float]]:
-    """hook_point: str is transformer lens format. example: f'blocks.{layer}.hook_resid_post'
-    By default, we save activations for all datasets, and then reuse them for each sae.
-    This is important to avoid recomputing activations for each SAE, and to ensure that the same activations are used for all SAEs.
-    However, it can use 10s of GBs of disk space."""
-
+    """
+    Compute results for one SAE without saving/loading intermediate artifacts.
+    """
     random.seed(config.random_seed)
     torch.manual_seed(config.random_seed)
 
-    os.makedirs(artifacts_folder, exist_ok=True)
-
     dataset_results = {}
-
     averaging_names = []
 
     for dataset_name in config.dataset_names:
@@ -654,17 +597,12 @@ def run_eval_single_sae(
                     sae.cfg.hook_layer,
                     sae.cfg.hook_name,
                     device,
-                    artifacts_folder,
-                    save_activations,
-                    column1_vals,
+                    column1_vals=column1_vals,
                 )
 
                 processed_results = get_scr_plotting_dict(raw_results, llm_clean_accs)
-
                 dataset_results[f"{run_name}_results"] = processed_results
-
                 averaging_names.append(run_name)
-
         else:
             run_name = f"{dataset_name}_tpp"
             raw_results, llm_clean_accs = run_eval_single_dataset(
@@ -675,13 +613,10 @@ def run_eval_single_sae(
                 sae.cfg.hook_layer,
                 sae.cfg.hook_name,
                 device,
-                artifacts_folder,
-                save_activations,
             )
 
             processed_results = create_tpp_plotting_dict(raw_results, llm_clean_accs)
             dataset_results[f"{run_name}_results"] = processed_results
-
             averaging_names.append(run_name)
 
     results_dict = general_utils.average_results_dictionaries(dataset_results, averaging_names)
@@ -700,14 +635,10 @@ def run_eval(
     output_path: str,
     force_rerun: bool = False,
     clean_up_activations: bool = False,
-    save_activations: bool = True,
 ):
     """
-    selected_saes is a list of either tuples of (sae_lens release, sae_lens id) or (sae_name, SAE object)
-
-    If clean_up_activations is True, which means that the activations are deleted after the evaluation is done.
-    You may want to use this because activations for all datasets can easily be 10s of GBs.
-    Return dict is a dict of SAE name: evaluation results for that SAE."""
+    Evaluate multiple SAEs on multiple datasets without saving/loading activations or probes.
+    """
     eval_instance_id = get_eval_uuid()
     sae_lens_version = get_sae_lens_version()
     sae_bench_commit_hash = get_sae_bench_version()
@@ -716,15 +647,14 @@ def run_eval(
         eval_type = EVAL_TYPE_ID_SCR
     else:
         eval_type = EVAL_TYPE_ID_TPP
+
     output_path = os.path.join(output_path, eval_type)
     os.makedirs(output_path, exist_ok=True)
 
-    artifacts_base_folder = "artifacts"
-
+    # No artifacts folder usage here since we're not saving activations
     results_dict = {}
 
     llm_dtype = general_utils.str_to_dtype(config.llm_dtype)
-
     model = HookedTransformer.from_pretrained_no_processing(
         config.model_name, device=device, dtype=llm_dtype
     )
@@ -733,14 +663,12 @@ def run_eval(
         selected_saes, desc="Running SAE evaluation on all selected SAEs"
     ):
         del_sae = False
-        # Handle both pretrained SAEs (identified by string) and custom SAEs (passed as objects)
         if isinstance(sae_id, str):
             sae = SAE.from_pretrained(
                 release=sae_release,
                 sae_id=sae_id,
                 device=device,
             )[0]
-            # If loading from pretrained, we delete the SAE object after use
             del_sae = True
         else:
             sae = sae_id
@@ -748,103 +676,76 @@ def run_eval(
 
         sae = sae.to(device=device, dtype=llm_dtype)
 
-        artifacts_folder = os.path.join(
-            artifacts_base_folder, eval_type, config.model_name, sae.cfg.hook_name
+        # Just run the evaluation; no loading from disk.
+        scr_or_tpp_results = run_eval_single_sae(
+            config,
+            sae,
+            model,
+            device,
         )
+
+        if eval_type == EVAL_TYPE_ID_SCR:
+            eval_output = ScrEvalOutput(
+                eval_type_id=eval_type,
+                eval_config=config,
+                eval_id=eval_instance_id,
+                datetime_epoch_millis=int(datetime.now().timestamp() * 1000),
+                eval_result_metrics=ScrMetricCategories(
+                    scr_metrics=ScrMetrics(
+                        **{k: v for k, v in scr_or_tpp_results.items() if not isinstance(v, dict)}
+                    )
+                ),
+                eval_result_details=[
+                    ScrResultDetail(
+                        dataset_name=dataset_name,
+                        **result,
+                    )
+                    for dataset_name, result in scr_or_tpp_results.items()
+                    if isinstance(result, dict)
+                ],
+                sae_bench_commit_hash=sae_bench_commit_hash,
+                sae_lens_id=sae_id,
+                sae_lens_release_id=sae_release,
+                sae_lens_version=sae_lens_version,
+            )
+        elif eval_type == EVAL_TYPE_ID_TPP:
+            eval_output = TppEvalOutput(
+                eval_type_id=eval_type,
+                eval_config=config,
+                eval_id=eval_instance_id,
+                datetime_epoch_millis=int(datetime.now().timestamp() * 1000),
+                eval_result_metrics=TppMetricCategories(
+                    tpp_metrics=TppMetrics(
+                        **{k: v for k, v in scr_or_tpp_results.items() if not isinstance(v, dict)}
+                    )
+                ),
+                eval_result_details=[
+                    TppResultDetail(
+                        dataset_name=dataset_name,
+                        **result,
+                    )
+                    for dataset_name, result in scr_or_tpp_results.items()
+                    if isinstance(result, dict)
+                ],
+                sae_bench_commit_hash=sae_bench_commit_hash,
+                sae_lens_id=sae_id,
+                sae_lens_release_id=sae_release,
+                sae_lens_version=sae_lens_version,
+            )
+        else:
+            raise ValueError(f"Invalid eval type: {eval_type}")
 
         sae_result_file = f"{sae_release}_{sae_id}_eval_results.json"
         sae_result_file = sae_result_file.replace("/", "_")
         sae_result_path = os.path.join(output_path, sae_result_file)
-
-        if os.path.exists(sae_result_path) and not force_rerun:
-            print(f"Loading existing results from {sae_result_path}")
-            with open(sae_result_path, "r") as f:
-                if eval_type == EVAL_TYPE_ID_SCR:
-                    eval_output = TypeAdapter(ScrEvalOutput).validate_json(f.read())
-                elif eval_type == EVAL_TYPE_ID_TPP:
-                    eval_output = TypeAdapter(TppEvalOutput).validate_json(f.read())
-                else:
-                    raise ValueError(f"Invalid eval type: {eval_type}")
-        else:
-            scr_or_tpp_results = run_eval_single_sae(
-                config,
-                sae,
-                model,
-                device,
-                artifacts_folder,
-                save_activations,
-            )
-            if eval_type == EVAL_TYPE_ID_SCR:
-                eval_output = ScrEvalOutput(
-                    eval_type_id=eval_type,
-                    eval_config=config,
-                    eval_id=eval_instance_id,
-                    datetime_epoch_millis=int(datetime.now().timestamp() * 1000),
-                    eval_result_metrics=ScrMetricCategories(
-                        scr_metrics=ScrMetrics(
-                            **{
-                                k: v
-                                for k, v in scr_or_tpp_results.items()
-                                if not isinstance(v, dict)
-                            }
-                        )
-                    ),
-                    eval_result_details=[
-                        ScrResultDetail(
-                            dataset_name=dataset_name,
-                            **result,
-                        )
-                        for dataset_name, result in scr_or_tpp_results.items()
-                        if isinstance(result, dict)
-                    ],
-                    sae_bench_commit_hash=sae_bench_commit_hash,
-                    sae_lens_id=sae_id,
-                    sae_lens_release_id=sae_release,
-                    sae_lens_version=sae_lens_version,
-                )
-            elif eval_type == EVAL_TYPE_ID_TPP:
-                eval_output = TppEvalOutput(
-                    eval_type_id=eval_type,
-                    eval_config=config,
-                    eval_id=eval_instance_id,
-                    datetime_epoch_millis=int(datetime.now().timestamp() * 1000),
-                    eval_result_metrics=TppMetricCategories(
-                        tpp_metrics=TppMetrics(
-                            **{
-                                k: v
-                                for k, v in scr_or_tpp_results.items()
-                                if not isinstance(v, dict)
-                            }
-                        )
-                    ),
-                    eval_result_details=[
-                        TppResultDetail(
-                            dataset_name=dataset_name,
-                            **result,
-                        )
-                        for dataset_name, result in scr_or_tpp_results.items()
-                        if isinstance(result, dict)
-                    ],
-                    sae_bench_commit_hash=sae_bench_commit_hash,
-                    sae_lens_id=sae_id,
-                    sae_lens_release_id=sae_release,
-                    sae_lens_version=sae_lens_version,
-                )
-            else:
-                raise ValueError(f"Invalid eval type: {eval_type}")
+        eval_output.to_json_file(sae_result_path, indent=2)
 
         results_dict[f"{sae_release}_{sae_id}"] = asdict(eval_output)
 
-        eval_output.to_json_file(sae_result_path, indent=2)
-
-    if clean_up_activations:
-        if os.path.exists(artifacts_folder):
-            shutil.rmtree(artifacts_folder)
-
-    if del_sae:
-        del sae
-    gc.collect()
-    torch.cuda.empty_cache()
+        if del_sae:
+            del sae
+        gc.collect()
+        torch.cuda.empty_cache()
 
     return results_dict
 
@@ -938,66 +839,41 @@ def arg_parser():
         "--llm_batch_size",
         type=int,
         default=None,
-        help="Batch size for LLM. If None, will be populated using LLM_NAME_TO_BATCH_SIZE",
+        help="Batch size for LLM. If None, uses a default based on the model name.",
     )
     parser.add_argument(
         "--llm_dtype",
         type=str,
         default=None,
         choices=[None, "float32", "float64", "float16", "bfloat16"],
-        help="Data type for LLM. If None, will be populated using LLM_NAME_TO_DTYPE",
+        help="Data type for LLM. If None, a default is used.",
     )
     parser.add_argument(
         "--sae_batch_size",
         type=int,
         default=None,
-        help="Batch size for SAE. If None, will be populated using default config value",
+        help="Batch size for SAE. If None, default config value is used.",
     )
     parser.add_argument(
         "--lower_vram_usage",
         action="store_true",
-        help="Lower GPU memory usage by moving model to CPU when not required. Useful on 1M width SAEs. Will be slower and require more system memory.",
+        help="Lower GPU memory usage by moving model to CPU when not required.",
     )
 
     return parser
 
 
 if __name__ == "__main__":
-    """
-    Example pythia-70m usage:
-    python evals/scr_and_tpp/main.py \
-    --sae_regex_pattern "sae_bench_pythia70m_sweep_standard_ctx128_0712" \
-    --sae_block_pattern "blocks.4.hook_resid_post__trainer_10" \
-    --model_name pythia-70m-deduped \
-    --perform_scr true
-
-    Example Gemma-2-2B SAE Bench usage:
-    python evals/scr_and_tpp/main.py \
-    --sae_regex_pattern "sae_bench_gemma-2-2b_topk_width-2pow14_date-1109" \
-    --sae_block_pattern "blocks.19.hook_resid_post__trainer_2" \
-    --model_name gemma-2-2b \
-    --perform_scr true
-
-    Example Gemma-2-2B Gemma-Scope usage:
-    python evals/scr_and_tpp/main.py \
-    --sae_regex_pattern "gemma-scope-2b-pt-res" \
-    --sae_block_pattern "layer_20/width_16k/average_l0_139" \
-    --model_name gemma-2-2b \
-    --perform_scr true
-    """
     args = arg_parser().parse_args()
     device = general_utils.setup_environment()
 
     start_time = time.time()
 
     config, selected_saes = create_config_and_selected_saes(args)
-
     print(selected_saes)
 
-    # create output folder
     os.makedirs(args.output_folder, exist_ok=True)
 
-    # run the evaluation on all selected SAEs
     results_dict = run_eval(
         config,
         selected_saes,
@@ -1009,57 +885,4 @@ if __name__ == "__main__":
     )
 
     end_time = time.time()
-
     print(f"Finished evaluation in {end_time - start_time} seconds")
-
-
-# Use this code snippet to use custom SAE objects
-# if __name__ == "__main__":
-#     import custom_saes.identity_sae as identity_sae
-#     import custom_saes.jumprelu_sae as jumprelu_sae
-
-#     """
-#     python evals/scr_and_tpp/main.py
-#     """
-#     device = general_utils.setup_environment()
-
-#     start_time = time.time()
-
-#     random_seed = 42
-#     output_folder = "eval_results"
-#     perform_scr = True
-
-#     model_name = "gemma-2-2b"
-#     hook_layer = 20
-
-#     repo_id = "google/gemma-scope-2b-pt-res"
-#     filename = f"layer_{hook_layer}/width_16k/average_l0_71/params.npz"
-#     sae = jumprelu_sae.load_jumprelu_sae(repo_id, filename, hook_layer)
-#     selected_saes = [(f"{repo_id}_{filename}_gemmascope_sae", sae)]
-
-#     config = ScrAndTppEvalConfig(
-#         random_seed=random_seed,
-#         model_name=model_name,
-#         perform_scr=perform_scr,
-#     )
-
-#     config.llm_batch_size = activation_collection.LLM_NAME_TO_BATCH_SIZE[config.model_name]
-#     config.llm_dtype = activation_collection.LLM_NAME_TO_DTYPE[config.model_name]
-
-#     # create output folder
-#     os.makedirs(output_folder, exist_ok=True)
-
-#     # run the evaluation on all selected SAEs
-#     results_dict = run_eval(
-#         config,
-#         selected_saes,
-#         device,
-#         output_folder,
-#         force_rerun=True,
-#         clean_up_activations=False,
-#         save_activations=True,
-#     )
-
-#     end_time = time.time()
-
-#     print(f"Finished evaluation in {end_time - start_time} seconds")
