@@ -79,7 +79,7 @@ def get_effects_per_class_precomputed_acts(
         nonzero_acts_BL = (activations_BL != 0.0).to(dtype=dtype)
         nonzero_acts_B = einops.reduce(nonzero_acts_BL, "B L -> B", "sum").to(torch.float32)
 
-        f_BLF = sae.encode(activation_batch_BLD)
+        f_BLF = sae.encode(activation_batch_BLD).to(nonzero_acts_BL.device)
         f_BLF = f_BLF * nonzero_acts_BL[:, :, None]  # zero out masked tokens
 
         # Get the average activation per input. We divide by the number of nonzero activations for the attention mask
@@ -199,13 +199,13 @@ def ablated_precomputed_activations(
         nonzero_acts_B = einops.reduce(nonzero_acts_BL, "B L -> B", "sum")
 
         f_BLF = sae.encode(activation_batch_BLD)
-        x_hat_BLD = sae.decode(f_BLF)
+        x_hat_BLD = sae.decode(f_BLF).to(activation_batch_BLD.device)
 
         error_BLD = activation_batch_BLD - x_hat_BLD
 
         f_BLF[..., to_ablate] = 0.0  # zero ablation
 
-        modified_acts_BLD = sae.decode(f_BLF) + error_BLD
+        modified_acts_BLD = sae.decode(f_BLF).to(error_BLD.device) + error_BLD
 
         # Get the average activation per input. We divide by the number of nonzero activations for the attention mask
         probe_acts_BD = (

@@ -71,11 +71,11 @@ def run_eval(
             )[0]
             # If loading from pretrained, we delete the SAE object after use
             del_sae = True
+            sae = sae.to(device=device, dtype=llm_dtype)
         else:
             sae = sae_id
             sae_id = "custom_sae"
 
-        sae = sae.to(device=device, dtype=llm_dtype)
 
         k_sparse_probing_results = run_k_sparse_probing_experiment(
             model=model,

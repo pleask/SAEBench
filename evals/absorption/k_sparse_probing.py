@@ -109,6 +109,8 @@ def train_k_sparse_probes(
         labels = {label for _, label in train_labels}
         sparse_train_y = torch.nn.functional.one_hot(torch.tensor([idx for _, idx in train_labels]))
         sae_feat_acts = _get_sae_acts(sae, train_activations)
+        print("sae_feat_acts.shape", sae_feat_acts.shape)
+    
     l1_probe = (
         train_sparse_multi_probe(
             sae_feat_acts.to(sae.device),
@@ -151,18 +153,18 @@ def sae_k_sparse_metadata(
     layer: int,
 ) -> pd.DataFrame:
     norm_probe_weights = probe.weights / torch.norm(probe.weights, dim=-1, keepdim=True)
-    norm_W_enc = sae.W_enc / torch.norm(sae.W_enc, dim=0, keepdim=True)
+    # norm_W_enc = sae.W_enc / torch.norm(sae.W_enc, dim=0, keepdim=True)
     norm_W_dec = sae.W_dec / torch.norm(sae.W_dec, dim=-1, keepdim=True)
     probe_dec_cos = (
         (norm_probe_weights.to(dtype=norm_W_dec.dtype, device=norm_W_dec.device) @ norm_W_dec.T)
         .cpu()
         .float()
     )
-    probe_enc_cos = (
-        (norm_probe_weights.to(dtype=norm_W_enc.dtype, device=norm_W_enc.device) @ norm_W_enc)
-        .cpu()
-        .float()
-    )
+    # probe_enc_cos = (
+    #     (norm_probe_weights.to(dtype=norm_W_enc.dtype, device=norm_W_enc.device) @ norm_W_enc)
+    #     .cpu()
+    #     .float()
+    # )
 
     metadata: dict[str, float | str | float | np.ndarray] = {
         "layer": layer,
@@ -176,7 +178,7 @@ def sae_k_sparse_metadata(
             row["letter"] = letter
             row["k"] = k
             row["feats"] = k_probe.feature_ids.numpy()
-            row["cos_probe_sae_enc"] = probe_enc_cos[letter_i, k_probe.feature_ids].numpy()
+            # row["cos_probe_sae_enc"] = probe_enc_cos[letter_i, k_probe.feature_ids].numpy()
             row["cos_probe_sae_dec"] = probe_dec_cos[letter_i, k_probe.feature_ids].numpy()
             row["weights"] = k_probe.weight.float().numpy()
             row["bias"] = k_probe.bias.item()
@@ -335,7 +337,7 @@ def build_metrics_df(results_df, metadata_df, max_k_value: int):
 
             meta_row = metadata_df[(metadata_df["letter"] == letter) & (metadata_df["k"] == k)]
             auc_info[f"sparse_sae_k_{k}_feats"] = meta_row["feats"].iloc[0]
-            auc_info[f"cos_probe_sae_enc_k_{k}"] = meta_row["cos_probe_sae_enc"].iloc[0]
+            # auc_info[f"cos_probe_sae_enc_k_{k}"] = meta_row["cos_probe_sae_enc"].iloc[0]
             auc_info[f"cos_probe_sae_dec_k_{k}"] = meta_row["cos_probe_sae_dec"].iloc[0]
             auc_info[f"sparse_sae_k_{k}_weights"] = meta_row["weights"].iloc[0]
             auc_info[f"sparse_sae_k_{k}_bias"] = meta_row["bias"].iloc[0]

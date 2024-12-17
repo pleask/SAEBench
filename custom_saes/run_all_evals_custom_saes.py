@@ -14,8 +14,18 @@ import sae_bench_utils.general_utils as general_utils
 RANDOM_SEED = 42
 
 MODEL_CONFIGS = {
-    "pythia-70m-deduped": {"batch_size": 512, "dtype": "float32", "layers": [3, 4], "d_model": 512},
-    "gemma-2-2b": {"batch_size": 32, "dtype": "bfloat16", "layers": [5, 12, 19], "d_model": 2304},
+    "pythia-70m-deduped": {
+        "batch_size": 512,
+        "dtype": "float32",
+        "layers": [3, 4],
+        "d_model": 512,
+    },
+    "gemma-2-2b": {
+        "batch_size": 32,
+        "dtype": "bfloat16",
+        "layers": [5, 12, 19],
+        "d_model": 2304,
+    },
 }
 
 output_folders = {
@@ -146,7 +156,9 @@ def run_evals(
         "unlearning": (
             lambda: unlearning.run_eval(
                 unlearning.UnlearningEvalConfig(
-                    model_name="gemma-2-2b-it", random_seed=RANDOM_SEED, llm_dtype=llm_dtype
+                    model_name="gemma-2-2b-it",
+                    random_seed=RANDOM_SEED,
+                    llm_dtype=llm_dtype,
                 ),
                 selected_saes,
                 device,
@@ -168,7 +180,9 @@ def run_evals(
             print("Skipping, need to clean up unlearning interface")
             continue  # TODO:
             if not os.path.exists("./evals/unlearning/data/bio-forget-corpus.jsonl"):
-                print("Skipping unlearning evaluation due to missing bio-forget-corpus.jsonl")
+                print(
+                    "Skipping unlearning evaluation due to missing bio-forget-corpus.jsonl"
+                )
                 continue
 
         print(f"\n\n\nRunning {eval_type} evaluation\n\n\n")
@@ -215,7 +229,9 @@ if __name__ == "__main__":
     save_activations = False
 
     for hook_layer in MODEL_CONFIGS[model_name]["layers"]:
-        sae = identity_sae.IdentitySAE(model_name, d_model, hook_layer, context_size=128)
+        sae = identity_sae.IdentitySAE(
+            model_name, d_model, hook_layer, context_size=128
+        )
         selected_saes = [(f"{model_name}_layer_{hook_layer}_identity_sae", sae)]
 
         # This will evaluate PCA SAEs
